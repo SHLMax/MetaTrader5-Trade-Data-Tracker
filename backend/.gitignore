@@ -1,4 +1,5 @@
 test_mt5.py
 test_out.txt
 test_out2.txt
+clean_db.py
 __pycache__

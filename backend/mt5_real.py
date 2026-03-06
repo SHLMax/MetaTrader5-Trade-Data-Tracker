@@ -232,12 +232,25 @@ async def stream_mt5_data():
 
     while True:
         try:
-            async with websockets.connect(WS_URI, ping_interval=300, ping_timeout=600) as websocket:
+               async with websockets.connect(WS_URI, ping_interval=20, ping_timeout=20) as websocket:
                 print("Connected to FastAPI WebSocket.")
                 
-                while True:
-                    # Discover all running MT5 terminals
-                    terminals = find_mt5_terminals()
+                # Background task to drain the socket so server pings are answered
+                async def consume_pings():
+                    try:
+                        while True:
+                            await websocket.recv()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                        
+                reader_task = asyncio.create_task(consume_pings())
+                
+                try:
+                    while True:
+                        # Discover all running MT5 terminals
+                        terminals = find_mt5_terminals()
                     if not terminals:
                         print("No MT5 terminals found. Retrying in 5s...")
                         await asyncio.sleep(5)
@@ -247,13 +260,17 @@ async def stream_mt5_data():
                         try:
                             # 1. Open Positions
                             positions, account_id, account_name, broker = get_open_positions(terminal_path)
-                            await websocket.send(json.dumps({
-                                "type": "OPEN_POSITIONS_UPDATE",
-                                "data": positions,
-                                "account_id": account_id,
-                                "account_name": account_name,
-                                "broker": broker
-                            }))
+                            
+                            await asyncio.wait_for(
+                                websocket.send(json.dumps({
+                                    "type": "OPEN_POSITIONS_UPDATE",
+                                    "data": positions,
+                                    "account_id": account_id,
+                                    "account_name": account_name,
+                                    "broker": broker
+                                })),
+                                timeout=10.0
+                            )
                             print(f"[{account_id}] Sent {len(positions)} open positions")
 
                             # 2. History Summaries (Only update when deals change)
@@ -270,15 +287,24 @@ async def stream_mt5_data():
                                             "type": "DAILY_SUMMARY_UPDATE",
                                             "data": summary
                                         }
-                                        await websocket.send(json.dumps(message))
+                                        await asyncio.wait_for(
+                                            websocket.send(json.dumps(message)),
+                                            timeout=10.0
+                                        )
                                 
                                 last_deals_count[account_id] = current_count
                         except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError) as e:
+                            print(f"[{account_id}] Connection Closed: {e}")
                             raise e  # Let the outer handler reconnect
+                        except asyncio.TimeoutError:
+                            print(f"[{account_id}] WebSocket send timeout! Forcing reconnect.")
+                            raise websockets.exceptions.ConnectionClosedError(None, None)
                         except Exception as e:
                             print(f"Error processing terminal {terminal_path}: {e}")
                     
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(2)
+                finally:
+                    reader_task.cancel()
                     
         except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosed):
             print("WebSocket disconnected, reconnecting in 5s...")
